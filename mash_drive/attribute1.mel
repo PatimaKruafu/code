@@ -1,0 +1,249 @@
+// global proc driveMASHFromBeatFile() { // Old version - better to pass args
+global proc driveMASHFromBeats(string $beatFilePath, string $mashNodeAndAttribute, float $onValue, float $offValue, int $attackFrames, int $decayFrames, float $preHoldTime, float $postHoldTime) {
+    // Example Usage in MEL Script Editor:
+    // driveMASHFromBeats("C:/path/to/your/beats.txt", "MASH1_Strength.amplitude", 1.0, 0.0, 0, 5, 0.0, 0.02);
+    // driveMASHFromBeats("D:/audio_projects/my_song_beats.txt", "MASH2_Offset.offsetY", 0.5, 0.0, 1, 10, 0.01, 0.05);
+    // driveMASHFromBeats("D:/audio_projects/kick_drum_beats.txt", "MASH_Color_Effects.colorGain[0]", 1.0, 0.2, 0, 3, 0.0, 0.01); // Animating Red of Gain
+
+    // --- Validation ---
+    if (!`filetest -f $beatFilePath`) {
+        error ("Beat file not found: " + $beatFilePath);
+        return;
+    }
+
+    // Check if MASH node and attribute exists (basic check)
+    // A more robust check would parse $mashNodeAndAttribute into node and attr separately.
+    string $sel[] = `ls $mashNodeAndAttribute`;
+    if (size($sel) == 0) {
+        warning ("MASH attribute not found or ambiguous: " + $mashNodeAndAttribute + ". Make sure it's correctly named (e.g., MASH1_Strength.amplitude). No keys will be set.");
+        // We could 'return' here, but sometimes people want to create keys on non-existent attributes to hook them up later.
+        // However, for safety and clarity, it's better to ensure it exists.
+        // For MASH nodes like MASH_Color.colorGain, the specific channel might be MASH_Color_Effects.colorGain[0] for Red, [1] for Green etc.
+        // It's often the "*_Effects" node for things like Color, Falloff etc. e.g., MASH1_Color_Effects.colorGain
+        // Use the attribute editor to find the exact name.
+    }
+
+
+    if ($attackFrames < 0) {
+        warning("Attack frames cannot be negative. Setting to 0.");
+        $attackFrames = 0;
+    }
+    if ($decayFrames < 0) {
+        warning("Decay frames cannot be negative. Setting to 0.");
+        $decayFrames = 0;
+    }
+     if ($preHoldTime < 0) {
+        warning("Pre-Hold time cannot be negative. Setting to 0.0.");
+        $preHoldTime = 0.0;
+    }
+    if ($postHoldTime < 0) {
+        warning("Post-Hold time cannot be negative. Setting to 0.0.");
+        $postHoldTime = 0.0;
+    }
+
+
+    // --- Get Scene Info ---
+    float $fps = 24.0; // Default FPS
+    string $currentUnit = `currentTimeUnitToFPS`;
+    if ($currentUnit == "game") $fps = 15.0;
+    else if ($currentUnit == "film") $fps = 24.0;
+    else if ($currentUnit == "pal") $fps = 25.0;
+    else if ($currentUnit == "ntsc") $fps = 30.0;
+    else if ($currentUnit == "show") $fps = 48.0;
+    else if ($currentUnit == "palf") $fps = 50.0;
+    else if ($currentUnit == "ntscf") $fps = 60.0;
+    // Add more for custom FPS if needed, or query `optionVar -q "workingUnitTimeFrameRate"`
+    print ("Using FPS: " + $fps + "\n");
+
+
+    // --- Read Beat File ---
+    int $fileID = `fopen $beatFilePath "r"`;
+    if ($fileID == 0) {
+        error ("Could not open beat file for reading: " + $beatFilePath);
+        return;
+    }
+
+    string $nextLine;
+    string $beatTimestampsSec[]; // Array to store beat timestamps in seconds
+
+    $nextLine = `fgetline $fileID`;
+    while (size($nextLine) > 0) {
+        // Clean up line, convert to float
+        $nextLine = strip($nextLine);
+        if (size($nextLine) > 0) { // Ensure not an empty line after stripping
+            float $timeSec = $nextLine; // MEL auto-converts string to float here
+            $beatTimestampsSec[size($beatTimestampsSec)] = $timeSec;
+        }
+        $nextLine = `fgetline $fileID`;
+    }
+    fclose $fileID;
+
+    if (size($beatTimestampsSec) == 0) {
+        warning ("No beat timestamps found in file: " + $beatFilePath);
+        return;
+    }
+
+    print("Loaded " + size($beatTimestampsSec) + " beat timestamps.\n");
+
+    // --- Clear Existing Keys (Optional, but usually desired) ---
+    // Consider the range for clearing keys carefully. For now, just clearing all on the attr.
+    print ("Clearing existing keys on: " + $mashNodeAndAttribute + "\n");
+    cutKey -clear $mashNodeAndAttribute;
+
+
+    // --- Set Keyframes ---
+    print("Setting keyframes...\n");
+    for ($timeSec in $beatTimestampsSec) {
+        float $beatFrameExact = $timeSec * $fps;
+
+        // Frame for the OFF value just BEFORE the attack starts
+        float $preBeatFrame = ($timeSec - $preHoldTime) * $fps - $attackFrames;
+        if ($attackFrames == 0 && $preHoldTime == 0) { // If no attack and no pre-hold, use frame just before beat
+            $preBeatFrame = floor($beatFrameExact) - 1;
+            if ($preBeatFrame < `playbackOptions -q -min`) $preBeatFrame = `playbackOptions -q -min`;
+        }
+         // Ensure preBeatFrame doesn't go below min timeline frame
+        $preBeatFrame = max($preBeatFrame, `playbackOptions -q -min`);
+
+
+        // Frame where the beat HITS and value is $onValue
+        float $hitFrame = $beatFrameExact; // Could be $beatFrameExact if $attackFrames > 0
+
+        // Frame where the ON value STARTS to decay (after post-hold)
+        float $decayStartFrame = ($timeSec + $postHoldTime) * $fps;
+
+        // Frame where the value returns to $offValue AFTER decay
+        float $postBeatFrame = ($timeSec + $postHoldTime) * $fps + $decayFrames;
+
+
+        // 1. Set key for OFF value leading up to the beat (if not the very first beat at frame 0/1)
+        // This helps to ensure the value is OFF before it turns ON
+        // Only set if it's meaningfully before the hitFrame.
+        if ($preBeatFrame < $hitFrame - 0.001) { // Check for distinct frame
+             setKeyframe -time $preBeatFrame -value $offValue -inTangentType "linear" -outTangentType "linear" $mashNodeAndAttribute;
+        }
+
+        // 2. Set key for ON value at the beat (or end of attack)
+        setKeyframe -time $hitFrame -value $onValue -inTangentType "linear" -outTangentType "linear" $mashNodeAndAttribute;
+
+        // 3. Set key for ON value at the START of decay (after post-hold)
+        // This creates the hold if postHoldTime > 0 or postHoldFrames > 0
+        if ($decayStartFrame > $hitFrame + 0.001) { // Only if there's a hold period
+            setKeyframe -time $decayStartFrame -value $onValue -inTangentType "linear" -outTangentType "linear" $mashNodeAndAttribute;
+        }
+
+        // 4. Set key for OFF value after decay
+        // Only set if decay duration is meaningful
+        if ($postBeatFrame > $decayStartFrame + 0.001) {
+             setKeyframe -time $postBeatFrame -value $offValue -inTangentType "linear" -outTangentType "linear" $mashNodeAndAttribute;
+        } else if ($decayFrames == 0 && $postHoldTime == 0) { // Sharp immediate off if no decay/hold
+             // This case usually means we want a very sharp pulse (on for one "moment")
+             // This logic is tricky because a 0-frame decay can make the value 'off' on the *same frame* as 'on'
+             // For a single frame pulse: on at 'hitFrame', off at 'hitFrame + 1' (if that's desired)
+             // For now, the existing logic should handle this; if no decay or hold, the 'onValue' at hitFrame will just stay until the next 'preBeatFrame' of the next beat.
+             // To make it go off explicitly after one frame if decay is 0:
+             // setKeyframe -time ($hitFrame + 1.0) -value $offValue -inTangentType "linear" -outTangentType "linear" $mashNodeAndAttribute;
+             // The current structure implicitly does this if the next beat isn't too close.
+             // If very short pulse (1 frame on) is desired and decay is 0, one might set tangents to "step" for the on value.
+             // The current "linear" ensures a ramp down, which is generally better.
+        }
+
+        // To ensure very sharp on/off, you might change in/outTangentType to "step" or "clamped"
+        // e.g. for hit: setKeyframe -itt "step" -ott "step" ...
+        // For most rhythmic pulses, linear ramps created by these keys are fine.
+    }
+    print ("Finished setting keyframes for " + $mashNodeAndAttribute + ".\n");
+    print ("If animation doesn't look right, check Graph Editor tangents (default linear). Try 'step' or 'clamped'.");
+    print ("Also adjust attackFrames, decayFrames, preHoldTime, and postHoldTime.");
+
+}
+
+// --- HOW TO USE THIS MEL SCRIPT ---
+// 1. Save the code above as a .mel file (e.g., mashBeatDriver.mel) in your Maya scripts directory,
+//    OR paste it directly into the MEL Script Editor.
+//
+// 2. Generate your `beats.txt` file using one of the methods in Part 1.
+//    Make sure this file contains timestamps in seconds, one per line.
+//
+// 3. Identify the MASH attribute you want to drive.
+//    - Select your MASH Waiter node (e.g., MASH1_Waiter).
+//    - Add a MASH node whose attribute you want to animate (e.g., Strength, Offset, Color, Visibility).
+//    - Find the exact attribute name.
+//      Examples:
+//        - MASH1_Strength.amplitude (for overall strength)
+//        - MASH1_Strength.randomStrength (for random strength variation)
+//        - MASH1_Offset.offsetX (for X position offset)
+//        - MASH1_Offset.offsetY
+//        - MASH1_Offset.offsetZ
+//        - MASH1_Offset.uniformScale (overall scale)
+//        - MASH1_Color.color (This is a compound. For specific channels, it's often the MASH1_Color_Effects node)
+//        - MASH1_Color_Effects.colorGainR (Red gain - older MASH versions might be MASH1_Color_Effects.colorGain.colorGainR or similar)
+//        - MASH1_Color_Effects.colorGain[0] (Red gain if colorGain is a float3 type, check Attribute Editor)
+//        - MASH1_Visibility.strength (overall visibility control)
+//
+// 4. Open the MEL Script Editor in Maya (Window > General Editors > Script Editor).
+//
+// 5. Call the function with your parameters.
+//    Syntax:
+//    driveMASHFromBeats("PATH_TO_BEATS_FILE", "MASH_NODE.ATTRIBUTE", ON_VALUE, OFF_VALUE, ATTACK_FRAMES, DECAY_FRAMES, PRE_HOLD_TIME_SEC, POST_HOLD_TIME_SEC);
+//
+//    Example Calls:
+//
+//    // Example 1: Drive MASH Strength amplitude. Quick pulse.
+//    // Hits 1.0 on beat, decays to 0.0 over 5 frames. No pre-hold, very short 0.02s post-hold.
+//    driveMASHFromBeats("C:/temp/my_song_beats.txt", "MASH1_Strength.amplitude", 1.0, 0.0, 0, 5, 0.0, 0.02);
+//
+//    // Example 2: Drive MASH Offset Y. Slower attack and decay, slight holds.
+//    // Ramps up to 0.5 over 1 frame, holds for 0.01s, then decays to 0.0 over 10 frames.
+//    driveMASHFromBeats("C:/temp/my_song_beats.txt", "MASH2_Offset.offsetY", 0.5, 0.0, 1, 10, 0.01, 0.01);
+//
+//    // Example 3: Drive MASH Color Red Gain (assuming MASH_Color_Effects node exists and colorGain is a float3).
+//    // Snappy red pulse. No attack, decays over 3 frames.
+//    // Note: Color attribute might be `MASH1_Color_Effects.colorGain[0]` for Red if `colorGain` is a float3 (vector).
+//    // Or if it's an older MASH version `MASH1_Color_Effects.colorGainR`. Check your Attribute Editor!
+//    driveMASHFromBeats("C:/temp/kick_drum_beats.txt", "MASH1_Color_Effects.colorGain[0]", 1.0, 0.2, 0, 3, 0.0, 0.0);
+//
+//    // Example 4: Stepped animation for visibility (on for the beat, off immediately after)
+//    // This one uses a very short decay (1 frame) to simulate 'step' like behavior with linear keys.
+//    // To get true step, you'd need to adjust setKeyframe tangents (-itt step -ott step).
+//    // Value 1 on beat, value 0 just after. 0s holds. Decays over 1 frame.
+//    driveMASHFromBeats("C:/temp/clap_beats.txt", "MASH1_Visibility.strength", 1.0, 0.0, 0, 1, 0.0, 0.0);
+//
+//
+// --- PARAMETERS EXPLAINED ---
+// - $beatFilePath (string): Full path to your "beats.txt" file.
+// - $mashNodeAndAttribute (string): The full name of the MASH node and attribute to key (e.g., "MASH1_Strength.amplitude").
+// - $onValue (float): The value the attribute should have AT the beat.
+// - $offValue (float): The value the attribute should return to AFTER the beat.
+// - $attackFrames (int): Number of frames BEFORE the exact beat time for the value to ramp UP from $offValue to $onValue.
+//                        Set to 0 for an instant ON.
+// - $decayFrames (int): Number of frames AFTER the beat (plus post-hold) for the value to ramp DOWN from $onValue to $offValue.
+//                       Set to 0 for an instant OFF (value will hold $onValue until just before next beat, or drop immediately if next beat is far).
+//                       A value of 1 here with 0 $postHoldTime can give a sharp drop right after the beat frame.
+// - $preHoldTime (float): Duration in SECONDS before the beat that the value stays at $offValue, *before* the attack phase begins.
+//                          This helps define a clear "off" state before the ramp up.
+// - $postHoldTime (float): Duration in SECONDS after the beat that the value STAYS at $onValue, *before* the decay phase begins.
+//                          Useful for sustaining the peak effect.
+//
+// --- IMPORTANT NOTES ---
+// * FPS: The script tries to determine your scene's FPS. Ensure your Maya scene FPS (Window > Settings/Preferences > Preferences > Settings > Time)
+//   matches the intended rhythm of your audio and beat detection.
+// * Attribute Naming: Be very precise with the MASH attribute name. Use the Attribute Editor or Channel Box to confirm.
+//   If your MASH network is named "MyCoolMASH", then it might be "MyCoolMASH_Strength.amplitude".
+// * Tangents: The script sets keyframes with "linear" in and out tangents.
+//   - For sharp, instant changes: You might want to go into the Graph Editor and change tangents to "Stepped".
+//     Or modify the `setKeyframe` commands in the script: e.g., `-inTangentType "step" -outTangentType "step"`.
+//   - For smoother transitions: "Spline" or "Clamped" tangents might be preferable.
+// * Overlapping Beats: If beats are very close and `decayFrames` is long, the decays will overlap.
+//   The script will simply set the keys as calculated; Maya's animation curves will interpolate between them. This is usually the desired behavior.
+// * Performance: This script generates keyframes. Once the keyframes are set, MASH playback performance depends on the complexity of your
+//   MASH network and scene, not this script (which has already finished its job).
+// * MASH_Audio Node: Maya's MASH also has an "Audio" node that can drive attributes directly from an audio file's amplitude.
+//   This script gives you beat-specific control rather than continuous amplitude-following.
+//
+// --- ADVANCED: Controlling specific channels of vector/color attributes ---
+// If you want to control, for example, only the RED channel of a MASH_Color node's `colorGain`:
+// The attribute might be named `MASH1_Color_Effects.colorGain[0]` or `MASH1_Color_Effects.colorGainR`.
+// You find this by looking at the MASH_Color_Effects node (or similar _Effects node for other types)
+// in the Attribute Editor and mousing over the R, G, B fields to see their script names.
+// For `translate` on a Transform node (e.g., via a MASH_Transform), it would be `pCube1.translateX`.
