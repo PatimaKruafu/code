@@ -1,9 +1,9 @@
 // mel_mashBeatDriver.mel
+// Script to drive a MASH attribute based on timestamps from a beat file.
 
+// Main logic procedure
 global proc driveMASHFromBeatFile(string $mashNodeAndAttribute, string $filePath, float $peakValue, float $baseValue, int $attackPreFrames, int $decayPostFrames) {
-    // ... (rest of the arguments and initial comments remain the same) ...
-
-    // --- Validate Inputs (This section remains the same as the previous corrected version) ---
+    // --- Validate Inputs ---
     string $nodeNamePart = "";
     string $attrNamePart = "";
     string $buffer[];
@@ -12,26 +12,27 @@ global proc driveMASHFromBeatFile(string $mashNodeAndAttribute, string $filePath
     if ($numTokens >= 2) {
         $nodeNamePart = $buffer[0];
         $attrNamePart = $buffer[1];
-        if ($numTokens > 2) {
+        if ($numTokens > 2) { // Handle attributes that might have dots themselves, e.g., someNode.compound.child
             for ($i=2; $i<$numTokens; $i++) {
                 $attrNamePart += "." + $buffer[$i];
             }
-            $mashNodeAndAttribute = $nodeNamePart + "." + $attrNamePart;
+            $mashNodeAndAttribute = $nodeNamePart + "." + $attrNamePart; // Reconstruct full plug for checking
         }
     } else {
         warning ("MASH Attribute '" + $mashNodeAndAttribute + "' is not in the required 'Node.Attribute' format (e.g., MASH1_Offset1.strength).");
         return;
     }
+
     if (!objExists($nodeNamePart)) {
         warning ("Node '" + $nodeNamePart + "' (from '" + $mashNodeAndAttribute + "') does not exist.");
         return;
     }
+
     if (!objExists($mashNodeAndAttribute)) { 
         warning ("Attribute '" + $mashNodeAndAttribute + "' does not exist on node '" + $nodeNamePart + "'.");
         return;
     }
     // --- End Input Validation ---
-
 
     int $fileID = fopen($filePath, "r");
     if ($fileID == 0) {
@@ -40,9 +41,8 @@ global proc driveMASHFromBeatFile(string $mashNodeAndAttribute, string $filePath
     }
 
     // --- Get FPS for time-to-frame conversion ---
-    // ++ Alternative FPS Detection Method ++
     float $fps = 24.0; // Default FPS
-    string $timeUnitSetting = `currentUnit -query -time`; // This gets the current time unit string (e.g., "film", "ntsc")
+    string $timeUnitSetting = `currentUnit -query -time`; 
 
     switch ($timeUnitSetting) {
         case "game":    $fps = 15.0; break;
@@ -50,97 +50,94 @@ global proc driveMASHFromBeatFile(string $mashNodeAndAttribute, string $filePath
         case "pal":     $fps = 25.0; break;
         case "ntsc":    $fps = 30.0; break;
         case "show":    
-            // For "show", we try to get the value from optionVar, though it might not always be up-to-date
-            // if changed programmatically without saving preferences.
             if (`optionVar -exists workingUnitTimeFrameRate`) {
                 string $showRate = `optionVar -query workingUnitTimeFrameRate`;
-                // The optionVar stores it like "ntsc", "film", "2fps", "1000fps" etc.
-                // So we re-evaluate. This is a bit recursive but handles "Nfps" stored in show.
                 if (endsWith($showRate, "fps")) {
                     string $fpsStr = substring($showRate, 1, size($showRate)-3);
-                    $fps = (float)$fpsStr;
+                    float $parsedFpsShow = catchQuiet((float)$fpsStr);
+                    if ($parsedFpsShow > 0) $fps = $parsedFpsShow;
+                    else { warning("Time unit is 'show' with unparsable Nfps rate '" + $showRate + "'. Assuming 24 FPS."); $fps = 24.0; }
                 } else {
-                    // If it's a named preset like "ntsc" stored in "show", map it again.
+                    // If 'showRate' is a preset name like 'ntsc', 'film' etc.
                     switch ($showRate) {
-                        case "game":    $fps = 15.0; break;
-                        case "film":    $fps = 24.0; break;
-                        case "pal":     $fps = 25.0; break;
-                        case "ntsc":    $fps = 30.0; break;
-                        case "palf":    $fps = 50.0; break;
-                        case "ntscf":   $fps = 60.0; break;
-                        default:
-                            warning("Time unit is 'show' with an unrecognized rate '" + $showRate + "'. Assuming 24 FPS.");
-                            $fps = 24.0;
-                            break;
+                        case "game": $fps = 15.0; break; case "film": $fps = 24.0; break; case "pal": $fps = 25.0; break;
+                        case "ntsc": $fps = 30.0; break; case "palf": $fps = 50.0; break; case "ntscf": $fps = 60.0; break;
+                        default: warning("Time unit is 'show' with an unrecognized rate '" + $showRate + "'. Assuming 24 FPS."); $fps = 24.0; break;
                     }
                 }
-            } else {
-                 warning ("Time unit is 'show' and workingUnitTimeFrameRate optionVar not found. Assuming 24 FPS.");
-                 $fps = 24.0;
-            }
+            } else { warning ("Time unit is 'show' and workingUnitTimeFrameRate optionVar not found. Assuming 24 FPS."); $fps = 24.0; }
             break;
         case "palf":    $fps = 50.0; break;
         case "ntscf":   $fps = 60.0; break;
-        case "millisec": $fps = 1000.0; break; // Milliseconds is effectively 1000 "frames" per second
-        // Handle direct "Nfps" formats which `currentUnit -q -time` might return
-        default:
-            if (endsWith(tolower($timeUnitSetting), "fps")) { // tolower for case-insensitivity
+        case "millisec": $fps = 1000.0; break;
+        default: // Handles cases like "48fps", "120fps" etc.
+            if (endsWith(tolower($timeUnitSetting), "fps")) {
                 string $tempFpsStr = $timeUnitSetting;
-                $tempFpsStr = substitute("fps", tolower($tempFpsStr), ""); // remove "fps" (case-insensitive)
-                $tempFpsStr = substitute("FPS", $tempFpsStr, "");          // remove "FPS" (uppercase)
+                // Remove "fps" (case-insensitive for 'fps' but MEL substitute is case-sensitive by default, so do both)
+                $tempFpsStr = substitute("fps", tolower($tempFpsStr), ""); 
+                $tempFpsStr = substitute("FPS", $tempFpsStr, "");          
                 
-                float $parsedFps = catchQuiet((float)$tempFpsStr); // Use catchQuiet to avoid error if not a number
-                if ($parsedFps > 0) {
-                    $fps = $parsedFps;
-                } else {
-                    warning ("Could not parse FPS from time unit string: '" + $timeUnitSetting + "'. Assuming 24 FPS.");
-                    $fps = 24.0;
-                }
-            } else {
-                warning ("Unrecognized time unit: '" + $timeUnitSetting + "'. Assuming 24 FPS.");
-                $fps = 24.0;
-            }
+                float $parsedFps = catchQuiet((float)$tempFpsStr); 
+                if ($parsedFps > 0) { $fps = $parsedFps; } 
+                else { warning ("Could not parse FPS from time unit string: '" + $timeUnitSetting + "'. Assuming 24 FPS."); $fps = 24.0;}
+            } else { warning ("Unrecognized time unit: '" + $timeUnitSetting + "'. Assuming 24 FPS."); $fps = 24.0;}
             break;
     }
     print ("Using FPS: " + $fps + " (derived from time unit: '" + $timeUnitSetting + "')\n");
     // -- End FPS Detection --
 
-
-    // --- Read timestamps and set keyframes --- (This section remains the same)
+    // --- Read timestamps and set keyframes ---
     string $nextLine;
-    print ("Setting initial base value...\n");
-    // ... (rest of the keyframing logic remains identical to the previous version) ...
+    
+    float $timelineMinFrame = `playbackOptions -q -minTime`; 
+
+    // Set an initial keyframe for the base value at the start of the timeline.
+    // This ensures the attribute begins at the baseValue before any beats.
+    print ("Setting initial base value at frame " + $timelineMinFrame + " for " + $mashNodeAndAttribute + "\n");
+    setKeyframe -time $timelineMinFrame -value $baseValue $mashNodeAndAttribute;
+
     while (!feof($fileID)) {
         $nextLine = fgetline($fileID);
-        $nextLine = trim($nextLine); 
+        $nextLine = trim($nextLine); // Remove leading/trailing whitespace
 
         if (size($nextLine) > 0) {
             float $beatTimeInSeconds = (float)$nextLine;
             float $beatFrame = $beatTimeInSeconds * $fps;
 
-            if ($beatFrame < 0) {
-                print ("Skipping beat time " + $beatTimeInSeconds + "s as it results in a negative frame ("+ $beatFrame +").\n");
+            // Skip beats that would result in a frame number that's excessively small (likely bad data or extreme negative time)
+            if ($beatTimeInSeconds < 0 && $beatFrame < -2000000000 ) { // Arbitrary large negative to catch unreasonable values
+                 print ("Skipping beat time " + $beatTimeInSeconds + "s as it results in an extremely negative frame ("+ $beatFrame +"). Ensure timestamps are reasonable.\n");
                 continue;
+            }
+            // Note for beats before timelineMinFrame, but allow them if user intends this.
+            if ($beatFrame < $timelineMinFrame && $beatTimeInSeconds >= 0) { // only print for non-negative times for clarity
+                 print ("Note: Beat time " + $beatTimeInSeconds + "s results in a frame ("+ $beatFrame +") before timeline start (" + $timelineMinFrame + "). Key will be set.\n");
             }
 
             float $preBeatFrame = $beatFrame - $attackPreFrames;
-            float $timelineMinFrame = `playbackOptions -q -minTime`; // Get min timeline frame
-
-            if ($preBeatFrame < $timelineMinFrame && $attackPreFrames > 0) {
+            
+            // If attackPreFrames positions the pre-beat key before the timeline minimum,
+            // and the actual beat is on or after the timeline minimum, clamp the pre-beat key to the timeline minimum.
+            // This prevents setting keys too far in negative time if the beat itself is near timeline start.
+            if ($attackPreFrames > 0 && $preBeatFrame < $timelineMinFrame && $beatFrame >= $timelineMinFrame) {
                 $preBeatFrame = $timelineMinFrame; 
             }
 
-            if ($attackPreFrames >= 0) {
-                 if ($attackPreFrames > 0 || $beatFrame == $timelineMinFrame ) { // Ensure logic for first frame
-                     if ($preBeatFrame < $beatFrame || ($preBeatFrame == $beatFrame && $preBeatFrame == $timelineMinFrame) ) { 
-                        setKeyframe -time $preBeatFrame -value $baseValue $mashNodeAndAttribute;
-                     }
-                }
+            // Simplified Pre-beat key logic:
+            // Only set a distinct pre-beat key if attackPreFrames is specified (greater than 0)
+            // AND this preBeatFrame is actually *before* the main beatFrame.
+            // This creates the "attack" ramp or step.
+            if ($attackPreFrames > 0 && $preBeatFrame < $beatFrame) {
+                 setKeyframe -time $preBeatFrame -value $baseValue $mashNodeAndAttribute;
             }
+            // If attackPreFrames is 0, the attribute remains at baseValue (from the previous beat's decay
+            // or the initial key set before the loop) until the exact beatFrame.
             
+            // Keyframe the peak value AT the beat
             setKeyframe -time $beatFrame -value $peakValue $mashNodeAndAttribute;
             print ("Set key: " + $mashNodeAndAttribute + " = " + $peakValue + " at frame " + $beatFrame + " (time " + $beatTimeInSeconds + "s)\n");
 
+            // Keyframe the decay back to base value AFTER the beat
             float $postBeatFrame = $beatFrame + $decayPostFrames;
             setKeyframe -time $postBeatFrame -value $baseValue $mashNodeAndAttribute;
             print ("Set key: " + $mashNodeAndAttribute + " = " + $baseValue + " at frame " + $postBeatFrame + "\n");
@@ -150,15 +147,113 @@ global proc driveMASHFromBeatFile(string $mashNodeAndAttribute, string $filePath
     fclose($fileID);
     print "Finished processing beat file and setting keyframes.\n";
     
-    // Optional: Set tangent types
+    // Optional: Set tangent types for all keys on the attribute for a specific feel.
+    // You might want to expose this choice in the UI later.
+    // Example: Sharp, sudden changes:
+    // keyTangent -inTangentType step -outTangentType step $mashNodeAndAttribute;
+    // Example: Smooth but fast ramps:
     // keyTangent -inTangentType clamped -outTangentType clamped $mashNodeAndAttribute;
+    // Example: Linear ramps:
+    // keyTangent -inTangentType linear -outTangentType linear $mashNodeAndAttribute;
 }
 
-// --- GUI Procedures (These remain UNCHANGED from the previous corrected version) ---
-// global proc createMashBeatDriverUI() { ... }
-// global proc loadSelectedMashAttributeFromUI() { ... }
-// global proc browseForBeatFileFromUI() { ... }
-// global proc callDriveMASHFromUI() { ... }
-//
-// To run the UI (after sourcing the script):
-// createMashBeatDriverUI();
+// --- GUI (Optional, but recommended for ease of use) ---
+global proc createMashBeatDriverUI() {
+    string $windowName = "mashBeatDriverWin";
+    if (`window -exists $windowName`) {
+        deleteUI $windowName;
+    }
+
+    window -title "MASH Beat Driver" -widthHeight 400 280 $windowName;
+    columnLayout -adjustableColumn true -rowSpacing 5 -columnAttach "both" 5;
+
+    textFieldButtonGrp -label "MASH Attr:" -text "MASH1_Waiter.MASH_Offset.strength" -buttonLabel "Load Selected" -bc "loadSelectedMashAttributeFromUI" mashAttrField;
+    
+    textFieldButtonGrp -label "Timestamps File:" -text "" -buttonLabel "Browse" -bc "browseForBeatFileFromUI" beatFileField;
+    
+    floatSliderGrp -label "Peak Value:" -field true -minValue -10000.0 -maxValue 10000.0 -value 1.0 -precision 3 -fieldStep 0.1 -cw3 100 60 100 peakValField;
+    floatSliderGrp -label "Base Value:" -field true -minValue -10000.0 -maxValue 10000.0 -value 0.0 -precision 3 -fieldStep 0.1 -cw3 100 60 100 baseValField;
+    
+    intSliderGrp -label "Attack Pre-Frames:" -field true -minValue 0 -maxValue 30 -value 1 -fieldStep 1 -cw3 100 50 50 attackFramesField;
+    intSliderGrp -label "Decay Post-Frames:" -field true -minValue 1 -maxValue 60 -value 5 -fieldStep 1 -cw3 100 50 50 decayFramesField; // Must be >= 1
+
+    button -label "Drive MASH Animation!" -h 30 -c "callDriveMASHFromUI";
+    
+    setParent ..;
+    showWindow $windowName;
+}
+
+// Helper proc for UI: Load selected node and attribute
+global proc loadSelectedMashAttributeFromUI() {
+    string $sel[] = `ls -sl -long`; // Get long names to be unambiguous
+    string $attrFromCB[] = `selectedChannelBoxAttributes`; 
+
+    if (size($sel) == 1) {
+        string $nodeName = $sel[0];
+        if (size($attrFromCB) == 1) {
+            textFieldButtonGrp -e -text ($nodeName + "." + $attrFromCB[0]) mashAttrField;
+        } else if (size($attrFromCB) == 0) {
+            // If a node is selected but no attribute, guess 'strength' or provide a common default
+            string $defaultAttr = "strength"; 
+            string $nodeType = `nodeType $nodeName`;
+
+            // Common MASH node attributes (examples, expand as needed)
+            if ($nodeType == "MASH_Signal") $defaultAttr = "amplitude";
+            else if ($nodeType == "MASH_Audio") $defaultAttr = "strength"; // Though audio node has its own driving
+            else if ($nodeType == "MASH_Offset" || $nodeType == "MASH_Transform" || $nodeType == "MASH_Scale" || $nodeType == "MASH_Rotate") $defaultAttr = "strength";
+            // Default to ".strength" if the attribute exists, otherwise just the node name.
+            if (objExists($nodeName + "." + $defaultAttr)) {
+                 textFieldButtonGrp -e -text ($nodeName + "." + $defaultAttr) mashAttrField;
+            } else {
+                 textFieldButtonGrp -e -text ($nodeName + ".strength") mashAttrField; // Fallback guess
+                 warning("Node '" + $nodeName + "' selected. Guessed attribute '.strength'. Please verify or change if needed.");
+            }
+        } else { // Multiple attributes selected in channel box
+            textFieldButtonGrp -e -text ($nodeName + "." + $attrFromCB[0]) mashAttrField;
+            warning("Multiple attributes selected in Channel Box for '" + $nodeName + "'. Using first one: '" + $attrFromCB[0] + "'. Please verify.");
+        }
+    } else if (size($sel) > 1) {
+        warning "Multiple nodes selected. Please select only ONE node and ONE attribute from the Channel Box.";
+    } else {
+        warning "No suitable node selected. Please select a node (and optionally an attribute in the Channel Box).";
+    }
+}
+
+// Helper proc for UI: Browse for timestamp file
+global proc browseForBeatFileFromUI() {
+    string $result[] = `fileDialog2 -fileMode 1 -caption "Select Beat Timestamps TXT File" -fileFilter "*.txt" -okc "Select"`;
+    if (size($result) > 0 && $result[0] != "") { // Check if a file was actually selected
+        textFieldButtonGrp -e -text $result[0] beatFileField;
+    }
+}
+
+// Helper proc for UI: Call the main driving function with UI values
+global proc callDriveMASHFromUI() {
+    string $mashAttr = `textFieldButtonGrp -q -text mashAttrField`;
+    string $filePath = `textFieldButtonGrp -q -text beatFileField`;
+    float $peakVal = `floatSliderGrp -q -value peakValField`;
+    float $baseVal = `floatSliderGrp -q -value baseValField`;
+    int $attackF = `intSliderGrp -q -value attackFramesField`;
+    int $decayF = `intSliderGrp -q -value decayFramesField`;
+
+    // Ensure decayPostFrames is at least 1, otherwise peak and base keys could be on same frame
+    if ($decayF < 1) {
+        warning "Decay Post-Frames was less than 1. Setting to 1 to avoid conflicting keyframes.";
+        $decayF = 1; 
+        // Optionally update the UI field as well:
+        // intSliderGrp -e -value 1 decayFramesField; 
+    }
+
+    driveMASHFromBeatFile($mashAttr, $filePath, $peakVal, $baseVal, $attackF, $decayF);
+}
+
+// --- How to use: ---
+// 1. Save this entire code as "mel_mashBeatDriver.mel" in your Maya scripts directory.
+// 2. In Maya's Script Editor (MEL tab), run:
+//    source "mel_mashBeatDriver.mel";
+//    createMashBeatDriverUI();
+// 3. A UI window will appear.
+//    - Load/Enter the MASH node and attribute (e.g., MASH1_Offset1.strength).
+//    - Browse to your beat timestamps .txt file.
+//    - Set Peak/Base values and Attack/Decay frames.
+//    - Click "Drive MASH Animation!".
